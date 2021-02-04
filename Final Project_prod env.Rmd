@@ -1,0 +1,376 @@
+---
+title: "Rough"
+author: "Sravan"
+date: "4/28/2020"
+output: word_document
+---
+
+```{r}
+# **************SET WORKING DIRECTORY AND CLEAR ENVIRONMENT ******************************
+library(rstudioapi)
+# Getting the path of your current open file
+current_path = rstudioapi::getActiveDocumentContext()$path 
+setwd(dirname(current_path ))
+rm(list=ls())
+options(scipen=999)
+options(warn = -1)
+IBport=4002 #7497
+
+# ********************* SET DATE RANGES AND SYSTEM PARAMETERS **********************************
+
+library(quantmod)
+library(dplyr)
+library(ranger)
+windowsize<-30
+longestindicator<-250
+currentdate<-Sys.Date()
+etfMoney=0
+
+datastart<-currentdate-round((windowsize+longestindicator)*1.5) # Note trading days are fewer than calendar days. Defines how many days in the past we need to get data from. i.e. we have a 100 day moving average so we need atleast 100 days. Our machine learning model needs 30 days to train so we need atleast 130 days. Then to be safe and make sure we have enough data we multiply 130 by 1.5
+tickers<-read.csv("SP Tickers.csv")
+additionData<-read.csv("SP Additions.csv")
+removalData<-read.csv("SP Removals.csv")
+dataMerge<- merge(additionData, removalData, all.x = TRUE, all.y=TRUE) #creates dataframe where each row represents a symbol and includes two columns, addition date and removal date
+symList<-as.character(tickers$Ticker)
+maxdaytrades<-10 # maximum LONG trades in one day
+```
+
+
+```{r}
+# ************************************* GET DATA FROM YAHOO **********************************************
+getData=function(){
+  firsttime<-TRUE #Variable used to construct dataset. If firsttime is True, then data from the first symbol will be placed in a dataframe. firsttime is then set to false. The loop repeats and instead of placing data for each symbol in a new dataframe, the code uses rbind to attach the data for each symbol to the existing dataframe
+  for (i in 1:length(symList)){
+    symData <- dataMerge[which(dataMerge[,'Ticker']==symList[i]),] #creates a dataframe that contains the name of the symbol currently iterated on and its addition and removal dates
+    fromDate <- strptime(as.character(symData$Date.Added), "%m/%d/%Y") #sets the from date to the addition date
+    fromDate <- format(fromDate, "%Y-%m-%d") #reformats the from date Y/m/d
+    toDate <- strptime(as.character(symData$Date.Removed), "%m/%d/%Y") #repeats same process for the to date
+    toDate <- format(toDate, "%Y-%m-%d")
+    
+    if((is.na(fromDate)) || (as.POSIXct(fromDate) < as.POSIXct(datastart))){ #if the from date is NA or the from data is before datastart then just set the from date to be datastart
+      fromDate <- datastart
+    }
+    if((is.na(toDate)) || (as.POSIXct(toDate) > as.POSIXct(currentdate))){ #if the todate is NA or the toDate is greater than the current data then just set the todate to be the currentdate
+      toDate <- currentdate
+    }
+    
+    tryCatch({
+      options("getSymbols.warning4.0"=FALSE) #Disables warnings shown when executing getSymbols command
+      temp<-getSymbols(symList[i], src="yahoo", from=fromDate, to=toDate, auto.assign = FALSE)
+      if(!is.null(temp)){
+        tempDF<- data.frame(date=index(temp),temp)
+        temp<-merge(symList[i], tempDF)
+        names(temp)<-c("symbol", "date", "open", "high", "low", "close", "volume", "adjusted")
+        temp$open<-temp$open*temp$adjusted/temp$close  # adjust open
+        temp$low<-temp$low*temp$adjusted/temp$close    # adjust low
+        temp$high<-temp$high*temp$adjusted/temp$close  # adjust high
+        temp$close<-temp$adjusted
+        temp<-temp[,c(1:7)]
+        if(firsttime){
+          sdata <- temp
+        }else{
+          sdata <- rbind(sdata, temp)
+        }
+        firsttime<-FALSE
+        cat("Ticker",symList[i],"added to stock data frame \n")
+      }
+    },
+    error=function(e) {
+      cat("ERROR :",conditionMessage(e), "\n")
+    })
+  }
+  return(sdata)
+}
+
+# ************************************** GENERATE INDICATORS *****************************************************
+
+genIndicators=function(sym){
+  print(paste('Generating Indicators for symbol: ',sym))
+  stock<-subset(stockData,stockData$symbol==sym)
+  stock.xts<-xts(stock[,c(3:7)],stock$date)
+  stock.xts$pastyearreturn = stock.xts$close/lag(stock.xts$close,250)
+  stock.xts$ema120<-tryCatch({
+    stock.xts$ema120<-EMA(stock.xts$close,n=120)  
+  }, warning=function(w) {stock.xts$ema120<-NA }, error=function(e) {stock.xts$ema120<-NA})
+  stock.xts$ema200<-tryCatch({
+    stock.xts$ema200<-EMA(stock.xts$close,n=200)
+  }, warning=function(w) {stock.xts$ema200<-NA }, error=function(e) {stock.xts$ema200<-NA})
+  stock.xts$cross120_200<-stock.xts$ema120/stock.xts$ema200
+  for (i in (1:ncol(stock.xts))){
+    inflist<-which(is.infinite(stock.xts[,i]))
+    if (!is.null(inflist)) {
+      for (j in inflist)
+        stock.xts[j,i]<-NA
+    }
+  }
+  stock.xts<-na.omit(stock.xts)  #omits all na values from the stock.xts
+  
+  if (nrow(stock.xts)>0) {
+    stock<-data.frame(stock.xts)
+    date<-as.Date(rownames(stock))
+    stock<-cbind(sym,date,stock)
+    rownames(stock)<-seq(1,nrow(stock),1)
+    stock$dow<-as.factor(weekdays(stock$date,abbreviate=TRUE))
+  }else stock<-NULL
+  
+  return(stock)
+}
+
+# ************************************** GENERATE SIGNALS ********************************************************
+
+genSignals=function(stock){# this funciton is used to generate long signal
+  stock$long<-ifelse(stock$cross120_200>1,1,0)
+  stock$price<-stock$close
+  stock<-subset(stock, stock$long==1) #Only returns stocks that have long signals
+  return(list(stock))
+}
+
+# *************************************** GENERATE TRADES ********************************************************
+
+genTrades=function(candidates,equity){
+  cashin<-0
+  cashout<-0
+  transcost<-0
+  numtrades<-0
+  if (nrow(candidates)>0) {
+    candidates<-candidates[order(-candidates$pastyearreturn),]
+    numtrades<-nrow(candidates)
+    if (numtrades>maxdaytrades) {
+      candidates<-candidates[c(1:maxdaytrades),]
+      numtrades<-maxdaytrades
+    }
+    tradeamount<-max((equity/(numtrades+1)),0)
+    etfMoney<<-tradeamount
+    cashout<-0
+    if (numtrades>0) {
+      candidates$position<-NA
+      for (i in 1:numtrades){
+        candidates$position[i]<-trunc(tradeamount/candidates$price[i])
+        if (candidates$long[i]==1) {
+          cashout<-cashout+candidates$position[i]*candidates$price[i]
+        } else {
+          cashin<-cashin+candidates$position[i]*candidates$price[i]
+        }
+      }
+      candidates<-subset(candidates,candidates$position>0)
+    }
+  } else candidates<-NULL
+  transcost<-1*numtrades+0.01*sum(candidates$position)
+  return(list(trades=candidates,cashin=cashin,cashout=cashout,transcost=transcost))
+}
+
+applyRules=function(day, equity){
+  candidates<-subset(signals,signals$date==day&signals$long==1)
+  longs<-genTrades(candidates,equity)
+  equity<-equity+longs$cashin-longs$cashout-longs$transcost
+  
+  return(list(long=longs$trades,cashin=longs$cashin,cashout=(longs$cashout+longs$transcost),transcost=longs$transcost))
+}
+
+```
+
+
+```{r}
+# ************************************** REVIEW TRADES **************************************************
+
+reviewTrades=function(trades) {
+  done<-FALSE
+  if (nrow(trades)>0){
+    trades<-trades[,c("sym","pastyearreturn","price","position")]
+    rownames(trades)<-seq(1,nrow(trades),1)
+  } else done<-TRUE
+  while (!done) {
+    View(trades)
+    cat("\014")
+    print(paste("REVIEWING CANDIDATES AND CHOOSING TO EXECUTE WILL SEND TRADES IMMEDIATELY TO IB."))
+    choice<-readline(prompt="Choose D)elete trade, M)odify Price, C)hange position, E)xecute, Q)uit without trading:  ")
+    choice<-toupper(choice)
+    done<-ifelse(choice=="E",TRUE,FALSE)
+    if (choice=="Q"){
+      trades<-trades[-c(1:nrow(trades)),]
+      done<- TRUE
+    }
+    if (choice=="M"){
+      rownum<-as.numeric(readline(prompt="Enter the row number corresponding to the trade you wish to modify: "))
+      valid<-ifelse(rownum>=1&rownum<=nrow(trades),TRUE,FALSE)
+      valid<-ifelse(is.na(valid),FALSE,valid)
+      if (valid) {
+        newprice<-as.numeric(readline(prompt=paste("Enter the new limit price for",trades$sym[rownum],": ")))
+        valid<-is.numeric(newprice)
+        valid<-ifelse(is.na(valid),FALSE,valid)
+        if (valid) {
+          trades$price[rownum]<-newprice
+        } else { 
+          print("invalid price")  
+          Sys.sleep(2)
+        }
+      } else {
+        print("invalid row number") 
+        Sys.sleep(2)
+      }
+    }
+    if (choice=="C"){
+      rownum<-as.numeric(readline(prompt="Enter the row number corresponding to the trade you wish to change: "))
+      valid<-ifelse(rownum>=1&rownum<=nrow(trades),TRUE,FALSE)
+      valid<-ifelse(is.na(valid),FALSE,valid)
+      if (valid) {
+        newposition<-as.numeric(readline(prompt=paste("Enter the new position size for",trades$sym[rownum],": ")))
+        valid<-is.numeric(newposition)
+        valid<-ifelse(is.na(valid),FALSE,valid)
+        if (valid) {
+          trades$position[rownum]<-newposition
+        } else { 
+          print("invalid position")  
+          Sys.sleep(2)
+        }
+      } else {
+        print("invalid row number") 
+        Sys.sleep(2)
+      }
+    }
+    if (choice=="D"){
+      rownum<-as.numeric(readline(prompt="Enter the row number corresponding to the trade you wish to delete: "))
+      valid<-ifelse(rownum>=1&rownum<=nrow(trades),TRUE,FALSE)
+      valid<-ifelse(is.na(valid),FALSE,valid)
+      if (valid) {
+        confirm<-as.character(readline(prompt=paste("Enter Y)es to confirm, N)o to abort removing the trade for
+                                                    ",trades$sym[rownum],": ")))
+        valid<-is.character(confirm)
+        valid<-ifelse(is.na(valid),FALSE,valid)
+        if (valid) {
+          if (toupper(confirm)=="Y") {
+            trades<-trades[-rownum,]
+            if(nrow(trades)==0){
+              print("Last candidate trade deleted")
+              Sys.sleep(2)
+            }
+          }
+        } else { 
+          print("invalid entry")  
+          Sys.sleep(2)
+        }
+      } else {
+        print("invalid row number") 
+        Sys.sleep(2)
+      }
+    }
+  }
+  return(trades)
+}
+
+# **************************************** EXECUTE TRADES ***************************************************
+
+executeTrades=function(trades,tws){
+  if (isConnected(twsconn=tws)){
+    print("Transmitting Orders...")
+    print('trasnmitting trades')
+    for(i in c(1:nrow(trades))){
+      equity<-twsEquity(as.character(trades$sym[i]),'SMART',primary="ISLAND")
+      OrdId<-reqIds(tws)
+      action <- ifelse(portfolioValue$position[i]>0,"SELL","BUY")
+      order<-twsOrder(OrdId,action=action,totalQuantity=abs(trades$position[i]),orderType="MKT",
+                      tif="GTD",goodTillDate = gtd)
+      placeOrder(tws,equity,order)
+    }
+    print('Finished transmitting trades')
+    dummy<-readline(prompt="Orders submitted, press <Enter> to continue:")
+  } else {
+    print("Connection with Interactive Brokers lost.  Trades not submitted!")
+    dummy<-readline(prompt="Press <Enter> to continue:")
+  }
+}
+
+```
+
+
+```{r}
+# ******************************************  RUN STRATEGY ********************************************
+stockData<-getData()
+#save(stockData, file = "stockData.RData")
+#load("stockData.RData")
+symbols<-unique(stockData$symbol)
+indicators<-NULL                               # we will put all OHLC data and our generated
+for (sym in symbols){                          # indicaters into a dataframe named "indicators"
+  temp<-genIndicators(sym)                     # by looping through all the symbols in our
+  if (!is.null(temp)) {                        # restricted stockData Need to ensure we have indicators  
+    if (is.null(indicators)) {                   
+      indicators<-temp} else
+        indicators<-rbind(indicators,temp)
+  }
+}
+
+lasttradedate<-max(as.Date(indicators$date))
+signals<-data.frame(genSignals(indicators))
+signals<-na.omit(signals)
+
+# **************************** OPEN CONNECTION & PROCESS TRADES  **************************************
+
+library(IBrokers)
+tws <-tryCatch({
+  tws = twsConnect(port=4002)
+}, warning=function(w) {tws<-NULL }, error=function(e) {tws<-NULL})
+
+temp<- strsplit(as.character(currentdate+1),"-")
+temp<-paste(temp[[1]][1],temp[[1]][2],temp[[1]][3], sep="")
+gtd<-paste(temp,"15:00:00",sep = " ")
+
+if(!is.null(tws)) {
+  acc<-reqAccountUpdates(tws)
+  portfolioValue<-twsPortfolioValue(acc)
+  available<-(as.numeric(acc[[1]]$CashBalance[1]))
+  trades<-applyRules(lasttradedate, available)
+  curtrades = trades[[1]]
+  
+  #Closing the positions not needed from previous month and updating positions(not placing orders) for current month
+  for (sym in portfolioValue$local){
+    if (sym %in% curtrades$sym){
+      rowIndx = which(as.character(portfolioValue$local) == sym)
+      currentPosition = portfolioValue$position[rowIndx]
+      
+      rowIndx = which(curtrades$sym == sym)
+      reqPosition = curtrades$position[rowIndx]
+      
+      if(reqPosition!=currentPosition){
+        if (reqPosition>currentPosition){
+          newPosition = reqPosition - currentPosition
+        }else {
+          newPosition = currentPosition - reqPosition
+        }
+        curtrades[rowIndx, 'position'] = newPosition
+      }
+    }else{
+      equity<-twsEquity(as.character(sym),'SMART',primary="ISLAND")
+      OrdId<-reqIds(tws)
+      rowIndx = which(as.character(portfolioValue$local) == sym)
+      action <- ifelse(portfolioValue$position[rowIndx]>0,"SELL","BUY")
+      order<-twsOrder(OrdId,action=action,totalQuantity=abs(portfolioValue$position[rowIndx]),orderType="MKT",
+                      tif="GTD",goodTillDate=gtd)
+      placeOrder(tws,equity,order)
+    }
+  }
+  trades[[1]] = curtrades
+  
+  #Reviewing and executing updated current month trades
+  if (!is.null(trades$long)) {
+    newtrades <-reviewTrades(trades[[1]])
+    if(nrow(newtrades)>0){
+      executeTrades(newtrades,tws)
+    } else {print("No trades to execute.")}
+  } else {print("No trades to execute.")}
+  
+  #Buying ETF with remaining amount
+  agg<-getSymbols('AGG', src="yahoo", from=lasttradedate, to=currentdate, auto.assign = FALSE)
+  available_cash = as.numeric(acc[[1]]$AvailableFunds[1])*0.8
+  etfMoney = min(etfMoney,available_cash)
+  price = as.numeric(agg$AGG.Adjusted[dim(agg)[1]])
+  quantity<- trunc(etfMoney/price)
+  
+  equity<-twsEquity('AGG','SMART',primary="ISLAND")
+  OrdId<-reqIds(tws)
+  order<-twsOrder(OrdId,action="BUY",totalQuantity=quantity, orderType="MKT",tif="GTD",goodTillDate = gtd)
+  placeOrder(tws,equity,order)
+} else {print("Aborting: Cannot connect to Interactive Brokers")}
+
+twsDisconnect(tws)
+print('Finished')
+```
